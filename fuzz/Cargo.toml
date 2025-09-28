@@ -1,0 +1,38 @@
+[package]
+name = "json-archive-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.0", features = ["derive"] }
+tempfile = "3.0"
+serde_json = "1.0"
+
+[dependencies.json-archive]
+path = ".."
+
+[[bin]]
+name = "fuzz_random_bytes"
+path = "fuzz_targets/fuzz_random_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_structured"
+path = "fuzz_targets/fuzz_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_mutations"
+path = "fuzz_targets/fuzz_mutations.rs"
+test = false
+doc = false
+bench = false
