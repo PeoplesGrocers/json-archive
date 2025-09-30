@@ -26,7 +26,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::diagnostics::{Diagnostic, DiagnosticCode, DiagnosticCollector, DiagnosticLevel};
-use crate::events::Header;
+use crate::event_deserialize::EventDeserializer;
+use crate::events::{Event, Header};
 use crate::pointer::JsonPointer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,8 +166,8 @@ impl ArchiveReader {
                 continue;
             }
 
-            let event = match serde_json::from_str::<Value>(&line) {
-                Ok(v) => v,
+            let event_deserializer = match serde_json::from_str::<EventDeserializer>(&line) {
+                Ok(d) => d,
                 Err(e) => {
                     diagnostics.add(
                         Diagnostic::new(
@@ -188,351 +189,188 @@ impl ArchiveReader {
                 }
             };
 
-            if let Some(arr) = event.as_array() {
-                if arr.is_empty() {
-                    diagnostics.add(
-                        Diagnostic::new(
-                            DiagnosticLevel::Fatal,
-                            DiagnosticCode::WrongFieldCount,
-                            "I found an empty array, but events must have at least a type field."
-                                .to_string(),
-                        )
+            // Add any diagnostics from deserialization with location info
+            for diagnostic in event_deserializer.diagnostics {
+                diagnostics.add(
+                    diagnostic
                         .with_location(self.filename.clone(), line_number)
-                        .with_snippet(format!("{} | {}", line_number, line)),
-                    );
-                    continue;
+                        .with_snippet(format!("{} | {}", line_number, line))
+                );
+            }
+
+            // Continue processing to collect additional errors before failing.
+            // Even though this function must now return an error, we continue to help
+            // the user identify all issues in the file at once rather than one at a time.
+            let event = match event_deserializer.event {
+                Some(e) => e,
+                None => {
+                    assert!(diagnostics.has_fatal(), "Expected a fatal diagnostic when deserialization fails");
+                    continue
+                },
+            };
+
+            match event {
+                Event::Observe { observation_id, timestamp: _, change_count } => {
+                    if let Some((_obs_id, obs_line, expected_count)) = &current_observation {
+                        if events_in_observation != *expected_count {
+                            diagnostics.add(
+                                Diagnostic::new(
+                                    DiagnosticLevel::Warning,
+                                    DiagnosticCode::ChangeCountMismatch,
+                                    format!(
+                                        "The observe event at line {} declared {} changes, but I found {}.",
+                                        obs_line, expected_count, events_in_observation
+                                    )
+                                )
+                                .with_location(self.filename.clone(), *obs_line)
+                                .with_advice(
+                                    "Make sure the change_count in the observe event matches the number of \
+                                     add/change/remove/move events that follow it."
+                                        .to_string()
+                                )
+                            );
+                        }
+                    }
+
+                    if seen_observations.contains(&observation_id) {
+                        diagnostics.add(
+                            Diagnostic::new(
+                                DiagnosticLevel::Warning,
+                                DiagnosticCode::DuplicateObservationId,
+                                format!("I found a duplicate observation ID: '{}'", observation_id),
+                            )
+                            .with_location(self.filename.clone(), line_number)
+                            .with_advice(
+                                "Each observation ID should be unique within the archive. \
+                                 Consider using UUIDs or timestamps to ensure uniqueness."
+                                    .to_string(),
+                            ),
+                        );
+                    }
+
+                    seen_observations.insert(observation_id.clone());
+                    current_observation = Some((observation_id, line_number, change_count));
+                    events_in_observation = 0;
+                    observation_count += 1;
                 }
 
-                let event_type = match arr[0].as_str() {
-                    Some(t) => t,
-                    None => {
+                Event::Add { path, value, observation_id } => {
+                    events_in_observation += 1;
+
+                    if self.mode == ReadMode::FullValidation
+                        && !seen_observations.contains(&observation_id)
+                    {
                         diagnostics.add(
                             Diagnostic::new(
                                 DiagnosticLevel::Fatal,
-                                DiagnosticCode::WrongFieldType,
-                                "I expected the first element of an event to be a string event type.".to_string()
+                                DiagnosticCode::NonExistentObservationId,
+                                format!("I found a reference to observation '{}', but I haven't seen an observe event with that ID yet.", observation_id)
                             )
                             .with_location(self.filename.clone(), line_number)
                             .with_snippet(format!("{} | {}", line_number, line))
                             .with_advice(
-                                "Events must look like [eventType, ...]. The eventType must be one of:\n\
-                                 observe, add, change, remove, move, snapshot."
+                                "Each add/change/remove/move event must reference an observation ID from a preceding observe event."
                                     .to_string()
                             )
                         );
                         continue;
                     }
-                };
 
-                match event_type {
-                    "observe" => {
-                        if let Some((_obs_id, obs_line, expected_count)) = &current_observation {
-                            if events_in_observation != *expected_count {
-                                diagnostics.add(
-                                    Diagnostic::new(
-                                        DiagnosticLevel::Warning,
-                                        DiagnosticCode::ChangeCountMismatch,
-                                        format!(
-                                            "The observe event at line {} declared {} changes, but I found {}.",
-                                            obs_line, expected_count, events_in_observation
-                                        )
-                                    )
-                                    .with_location(self.filename.clone(), *obs_line)
-                                    .with_advice(
-                                        "Make sure the change_count in the observe event matches the number of \
-                                         add/change/remove/move events that follow it."
-                                            .to_string()
-                                    )
-                                );
-                            }
-                        }
-
-                        if arr.len() != 4 {
-                            diagnostics.add(
-                                Diagnostic::new(
-                                    DiagnosticLevel::Fatal,
-                                    DiagnosticCode::WrongFieldCount,
-                                    format!("I expected an observe event to have 4 fields, but found {}.", arr.len())
-                                )
-                                .with_location(self.filename.clone(), line_number)
-                                .with_snippet(format!("{} | {}", line_number, line))
-                                .with_advice(
-                                    "Observe events must be: [\"observe\", observationId, timestamp, changeCount]"
-                                        .to_string()
-                                )
-                            );
-                            continue;
-                        }
-
-                        let obs_id = arr[1].as_str().unwrap_or("").to_string();
-                        let change_count = arr[3].as_u64().unwrap_or(0) as usize;
-
-                        if seen_observations.contains(&obs_id) {
-                            diagnostics.add(
-                                Diagnostic::new(
-                                    DiagnosticLevel::Warning,
-                                    DiagnosticCode::DuplicateObservationId,
-                                    format!("I found a duplicate observation ID: '{}'", obs_id),
-                                )
-                                .with_location(self.filename.clone(), line_number)
-                                .with_advice(
-                                    "Each observation ID should be unique within the archive. \
-                                     Consider using UUIDs or timestamps to ensure uniqueness."
-                                        .to_string(),
-                                ),
-                            );
-                        }
-
-                        seen_observations.insert(obs_id.clone());
-                        current_observation = Some((obs_id, line_number, change_count));
-                        events_in_observation = 0;
-                        observation_count += 1;
+                    if let Err(diag) = apply_add(&mut state, &path, value) {
+                        diagnostics.add(diag.with_location(self.filename.clone(), line_number));
+                        continue;
                     }
+                }
 
-                    "add" => {
-                        events_in_observation += 1;
-                        if arr.len() != 4 {
-                            diagnostics.add(
-                                Diagnostic::new(
-                                    DiagnosticLevel::Fatal,
-                                    DiagnosticCode::WrongFieldCount,
-                                    format!(
-                                        "I expected an add event to have 4 fields, but found {}.",
-                                        arr.len()
-                                    ),
-                                )
-                                .with_location(self.filename.clone(), line_number)
-                                .with_snippet(format!("{} | {}", line_number, line)),
-                            );
-                            continue;
-                        }
+                Event::Change { path, new_value, observation_id } => {
+                    events_in_observation += 1;
 
-                        let path = arr[1].as_str().unwrap_or("");
-                        let value = arr[2].clone();
-                        let obs_id = arr[3].as_str().unwrap_or("");
-
-                        if self.mode == ReadMode::FullValidation
-                            && !seen_observations.contains(obs_id)
-                        {
-                            diagnostics.add(
-                                Diagnostic::new(
-                                    DiagnosticLevel::Fatal,
-                                    DiagnosticCode::NonExistentObservationId,
-                                    format!("I found a reference to observation '{}', but I haven't seen an observe event with that ID yet.", obs_id)
-                                )
-                                .with_location(self.filename.clone(), line_number)
-                                .with_snippet(format!("{} | {}", line_number, line))
-                                .with_advice(
-                                    "Each add/change/remove/move event must reference an observation ID from a preceding observe event."
-                                        .to_string()
-                                )
-                            );
-                            continue;
-                        }
-
-                        if let Err(_) =
-                            self.apply_add(&mut state, path, value, line_number, &mut diagnostics)
-                        {
-                            continue;
-                        }
-                    }
-
-                    "change" => {
-                        events_in_observation += 1;
-                        if arr.len() != 4 {
-                            diagnostics.add(
-                                Diagnostic::new(
-                                    DiagnosticLevel::Fatal,
-                                    DiagnosticCode::WrongFieldCount,
-                                    format!(
-                                        "I expected a change event to have 4 fields, but found {}.",
-                                        arr.len()
-                                    ),
-                                )
-                                .with_location(self.filename.clone(), line_number)
-                                .with_snippet(format!("{} | {}", line_number, line)),
-                            );
-                            continue;
-                        }
-
-                        let path = arr[1].as_str().unwrap_or("");
-                        let new_value = arr[2].clone();
-                        let obs_id = arr[3].as_str().unwrap_or("");
-
-                        if self.mode == ReadMode::FullValidation
-                            && !seen_observations.contains(obs_id)
-                        {
-                            diagnostics.add(
-                                Diagnostic::new(
-                                    DiagnosticLevel::Fatal,
-                                    DiagnosticCode::NonExistentObservationId,
-                                    format!("I found a reference to observation '{}', but I haven't seen an observe event with that ID yet.", obs_id)
-                                )
-                                .with_location(self.filename.clone(), line_number)
-                            );
-                            continue;
-                        }
-
-                        if let Err(_) = self.apply_change(
-                            &mut state,
-                            path,
-                            new_value,
-                            line_number,
-                            &mut diagnostics,
-                        ) {
-                            continue;
-                        }
-                    }
-
-                    "remove" => {
-                        events_in_observation += 1;
-                        if arr.len() != 3 {
-                            diagnostics.add(
-                                Diagnostic::new(
-                                    DiagnosticLevel::Fatal,
-                                    DiagnosticCode::WrongFieldCount,
-                                    format!(
-                                        "I expected a remove event to have 3 fields, but found {}.",
-                                        arr.len()
-                                    ),
-                                )
-                                .with_location(self.filename.clone(), line_number)
-                                .with_snippet(format!("{} | {}", line_number, line)),
-                            );
-                            continue;
-                        }
-
-                        let path = arr[1].as_str().unwrap_or("");
-                        let obs_id = arr[2].as_str().unwrap_or("");
-
-                        if self.mode == ReadMode::FullValidation
-                            && !seen_observations.contains(obs_id)
-                        {
-                            diagnostics.add(
-                                Diagnostic::new(
-                                    DiagnosticLevel::Fatal,
-                                    DiagnosticCode::NonExistentObservationId,
-                                    format!("I found a reference to observation '{}', but I haven't seen an observe event with that ID yet.", obs_id)
-                                )
-                                .with_location(self.filename.clone(), line_number)
-                            );
-                            continue;
-                        }
-
-                        if let Err(_) =
-                            self.apply_remove(&mut state, path, line_number, &mut diagnostics)
-                        {
-                            continue;
-                        }
-                    }
-
-                    "move" => {
-                        events_in_observation += 1;
-                        if arr.len() != 4 {
-                            diagnostics.add(
-                                Diagnostic::new(
-                                    DiagnosticLevel::Fatal,
-                                    DiagnosticCode::WrongFieldCount,
-                                    format!(
-                                        "I expected a move event to have 4 fields, but found {}.",
-                                        arr.len()
-                                    ),
-                                )
-                                .with_location(self.filename.clone(), line_number)
-                                .with_snippet(format!("{} | {}", line_number, line)),
-                            );
-                            continue;
-                        }
-
-                        let path = arr[1].as_str().unwrap_or("");
-                        let moves = arr[2].clone();
-                        let obs_id = arr[3].as_str().unwrap_or("");
-
-                        if self.mode == ReadMode::FullValidation
-                            && !seen_observations.contains(obs_id)
-                        {
-                            diagnostics.add(
-                                Diagnostic::new(
-                                    DiagnosticLevel::Fatal,
-                                    DiagnosticCode::NonExistentObservationId,
-                                    format!("I found a reference to observation '{}', but I haven't seen an observe event with that ID yet.", obs_id)
-                                )
-                                .with_location(self.filename.clone(), line_number)
-                            );
-                            continue;
-                        }
-
-                        if let Err(_) =
-                            self.apply_move(&mut state, path, moves, line_number, &mut diagnostics)
-                        {
-                            continue;
-                        }
-                    }
-
-                    "snapshot" => {
-                        if arr.len() != 4 {
-                            diagnostics.add(
-                                Diagnostic::new(
-                                    DiagnosticLevel::Fatal,
-                                    DiagnosticCode::WrongFieldCount,
-                                    format!("I expected a snapshot event to have 4 fields, but found {}.", arr.len())
-                                )
-                                .with_location(self.filename.clone(), line_number)
-                                .with_snippet(format!("{} | {}", line_number, line))
-                            );
-                            continue;
-                        }
-
-                        let snapshot_state = arr[3].clone();
-
-                        if self.mode == ReadMode::FullValidation && state != snapshot_state {
-                            diagnostics.add(
-                                Diagnostic::new(
-                                    DiagnosticLevel::Warning,
-                                    DiagnosticCode::SnapshotStateMismatch,
-                                    "I found a snapshot whose state doesn't match the replayed state up to this point.".to_string()
-                                )
-                                .with_location(self.filename.clone(), line_number)
-                                .with_advice(
-                                    "This could indicate corruption or that events were applied incorrectly. \
-                                     The snapshot state should exactly match the result of replaying all events \
-                                     from the initial state."
-                                        .to_string()
-                                )
-                            );
-                        }
-
-                        state = snapshot_state;
-                    }
-
-                    _ => {
+                    if self.mode == ReadMode::FullValidation
+                        && !seen_observations.contains(&observation_id)
+                    {
                         diagnostics.add(
                             Diagnostic::new(
-                                DiagnosticLevel::Warning,
-                                DiagnosticCode::UnknownEventType,
-                                format!("I found an unknown event type: '{}'", event_type)
+                                DiagnosticLevel::Fatal,
+                                DiagnosticCode::NonExistentObservationId,
+                                format!("I found a reference to observation '{}', but I haven't seen an observe event with that ID yet.", observation_id)
                             )
                             .with_location(self.filename.clone(), line_number)
-                            .with_snippet(format!("{} | {}", line_number, line))
+                        );
+                        continue;
+                    }
+
+                    if let Err(diag) = apply_change(&mut state, &path, new_value) {
+                        diagnostics.add(diag.with_location(self.filename.clone(), line_number));
+                        continue;
+                    }
+                }
+
+                Event::Remove { path, observation_id } => {
+                    events_in_observation += 1;
+
+                    if self.mode == ReadMode::FullValidation
+                        && !seen_observations.contains(&observation_id)
+                    {
+                        diagnostics.add(
+                            Diagnostic::new(
+                                DiagnosticLevel::Fatal,
+                                DiagnosticCode::NonExistentObservationId,
+                                format!("I found a reference to observation '{}', but I haven't seen an observe event with that ID yet.", observation_id)
+                            )
+                            .with_location(self.filename.clone(), line_number)
+                        );
+                        continue;
+                    }
+
+                    if let Err(diag) = apply_remove(&mut state, &path) {
+                        diagnostics.add(diag.with_location(self.filename.clone(), line_number));
+                        continue;
+                    }
+                }
+
+                Event::Move { path, moves, observation_id } => {
+                    events_in_observation += 1;
+
+                    if self.mode == ReadMode::FullValidation
+                        && !seen_observations.contains(&observation_id)
+                    {
+                        diagnostics.add(
+                            Diagnostic::new(
+                                DiagnosticLevel::Fatal,
+                                DiagnosticCode::NonExistentObservationId,
+                                format!("I found a reference to observation '{}', but I haven't seen an observe event with that ID yet.", observation_id)
+                            )
+                            .with_location(self.filename.clone(), line_number)
+                        );
+                        continue;
+                    }
+
+                    if let Err(diag) = apply_move(&mut state, &path, moves) {
+                        diagnostics.add(diag.with_location(self.filename.clone(), line_number));
+                        continue;
+                    }
+                }
+
+                Event::Snapshot { observation_id: _, timestamp: _, object } => {
+                    if self.mode == ReadMode::FullValidation && state != object {
+                        diagnostics.add(
+                            Diagnostic::new(
+                                DiagnosticLevel::Fatal,
+                                DiagnosticCode::SnapshotStateMismatch,
+                                "I found a snapshot whose state doesn't match the replayed state up to this point.".to_string()
+                            )
+                            .with_location(self.filename.clone(), line_number)
                             .with_advice(
-                                "Valid event types are: observe, add, change, remove, move, snapshot. \
-                                 This line will be skipped."
+                                "This could indicate corruption or that events were applied incorrectly. \
+                                 The snapshot state should exactly match the result of replaying all events \
+                                 from the initial state."
                                     .to_string()
                             )
                         );
                     }
+
+                    state = object;
                 }
-            } else {
-                diagnostics.add(
-                    Diagnostic::new(
-                        DiagnosticLevel::Fatal,
-                        DiagnosticCode::WrongFieldType,
-                        "I expected an event to be a JSON array, but found a different type."
-                            .to_string(),
-                    )
-                    .with_location(self.filename.clone(), line_number)
-                    .with_snippet(format!("{} | {}", line_number, line)),
-                );
             }
         }
 
@@ -630,254 +468,107 @@ impl ArchiveReader {
         }
     }
 
-    fn apply_add(
-        &self,
-        state: &mut Value,
-        path: &str,
-        value: Value,
-        line_number: usize,
-        diagnostics: &mut DiagnosticCollector,
-    ) -> Result<(), ()> {
-        let pointer = match JsonPointer::new(path) {
-            Ok(p) => p,
-            Err(diag) => {
-                diagnostics.add(
-                    diag.with_location(self.filename.clone(), line_number)
-                        .with_advice(
-                            "JSON Pointer paths must start with '/' and use '/' to separate segments.\n\
-                             Special characters: use ~0 for ~ and ~1 for /"
-                                .to_string()
-                        )
-                );
-                return Err(());
-            }
-        };
+}
 
-        if let Err(diag) = pointer.set(state, value) {
-            diagnostics.add(
-                diag.with_location(self.filename.clone(), line_number)
-                    .with_advice(
-                        "For add operations, the parent path must exist. \
-                         For example, to add /a/b/c, the paths /a and /a/b must already exist."
-                            .to_string(),
+fn apply_add(state: &mut Value, path: &str, value: Value) -> Result<(), Diagnostic> {
+    let pointer = JsonPointer::new(path).map_err(|diag| {
+        diag.with_advice(
+            "JSON Pointer paths must start with '/' and use '/' to separate segments.\n\
+             Special characters: use ~0 for ~ and ~1 for /"
+                .to_string()
+        )
+    })?;
+
+    pointer.set(state, value).map_err(|diag| {
+        diag.with_advice(
+            "For add operations, the parent path must exist. \
+             For example, to add /a/b/c, the paths /a and /a/b must already exist."
+                .to_string()
+        )
+    })
+}
+
+fn apply_change(state: &mut Value, path: &str, new_value: Value) -> Result<(), Diagnostic> {
+    let pointer = JsonPointer::new(path)?;
+    pointer.set(state, new_value)?;
+    Ok(())
+}
+
+fn apply_remove(state: &mut Value, path: &str) -> Result<(), Diagnostic> {
+    let pointer = JsonPointer::new(path)?;
+    pointer.remove(state)?;
+    Ok(())
+}
+
+fn apply_move(
+    state: &mut Value,
+    path: &str,
+    moves: Vec<(usize, usize)>,
+) -> Result<(), Diagnostic> {
+    let pointer = JsonPointer::new(path)?;
+
+    let array = pointer.get(state)?;
+
+    if !array.is_array() {
+        return Err(
+            Diagnostic::new(
+                DiagnosticLevel::Fatal,
+                DiagnosticCode::MoveOnNonArray,
+                format!(
+                    "I can't apply move operations to '{}' because it's not an array.",
+                    path
+                ),
+            )
+            .with_advice(
+                "Move operations can only reorder elements within an array. \
+                 The path must point to an array value."
+                    .to_string(),
+            ),
+        );
+    }
+
+    let mut arr = array.as_array().unwrap().clone();
+
+    for (from_idx, to_idx) in moves {
+        if from_idx >= arr.len() {
+            return Err(
+                Diagnostic::new(
+                    DiagnosticLevel::Fatal,
+                    DiagnosticCode::MoveIndexOutOfBounds,
+                    format!(
+                        "The 'from' index {} is out of bounds (array length is {}).",
+                        from_idx,
+                        arr.len()
                     ),
+                )
             );
-            return Err(());
         }
 
-        Ok(())
-    }
-
-    fn apply_change(
-        &self,
-        state: &mut Value,
-        path: &str,
-        new_value: Value,
-        line_number: usize,
-        diagnostics: &mut DiagnosticCollector,
-    ) -> Result<(), ()> {
-        let pointer = match JsonPointer::new(path) {
-            Ok(p) => p,
-            Err(diag) => {
-                diagnostics.add(diag.with_location(self.filename.clone(), line_number));
-                return Err(());
-            }
-        };
-
-        if let Err(diag) = pointer.set(state, new_value) {
-            diagnostics.add(diag.with_location(self.filename.clone(), line_number));
-            return Err(());
+        if to_idx > arr.len() {
+            return Err(
+                Diagnostic::new(
+                    DiagnosticLevel::Fatal,
+                    DiagnosticCode::MoveIndexOutOfBounds,
+                    format!(
+                        "The 'to' index {} is out of bounds (array length is {}).",
+                        to_idx,
+                        arr.len()
+                    ),
+                )
+            );
         }
 
-        Ok(())
+        let element = arr[from_idx].clone();
+        arr.insert(to_idx, element);
+        let remove_idx = if from_idx > to_idx {
+            from_idx + 1
+        } else {
+            from_idx
+        };
+        arr.remove(remove_idx);
     }
 
-    fn apply_remove(
-        &self,
-        state: &mut Value,
-        path: &str,
-        line_number: usize,
-        diagnostics: &mut DiagnosticCollector,
-    ) -> Result<(), ()> {
-        let pointer = match JsonPointer::new(path) {
-            Ok(p) => p,
-            Err(diag) => {
-                diagnostics.add(diag.with_location(self.filename.clone(), line_number));
-                return Err(());
-            }
-        };
-
-        if let Err(mut diag) = pointer.remove(state) {
-            if self.mode == ReadMode::FullValidation {
-                diag.level = DiagnosticLevel::Fatal;
-            } else {
-                diag.level = DiagnosticLevel::Warning;
-            }
-
-            diagnostics.add(diag.with_location(self.filename.clone(), line_number));
-
-            if self.mode == ReadMode::FullValidation {
-                return Err(());
-            }
-        }
-
-        Ok(())
-    }
-
-    fn apply_move(
-        &self,
-        state: &mut Value,
-        path: &str,
-        moves_value: Value,
-        line_number: usize,
-        diagnostics: &mut DiagnosticCollector,
-    ) -> Result<(), ()> {
-        let pointer = match JsonPointer::new(path) {
-            Ok(p) => p,
-            Err(diag) => {
-                diagnostics.add(diag.with_location(self.filename.clone(), line_number));
-                return Err(());
-            }
-        };
-
-        let array = match pointer.get(state) {
-            Ok(v) => {
-                if !v.is_array() {
-                    diagnostics.add(
-                        Diagnostic::new(
-                            DiagnosticLevel::Fatal,
-                            DiagnosticCode::MoveOnNonArray,
-                            format!(
-                                "I can't apply move operations to '{}' because it's not an array.",
-                                path
-                            ),
-                        )
-                        .with_location(self.filename.clone(), line_number)
-                        .with_advice(
-                            "Move operations can only reorder elements within an array. \
-                             The path must point to an array value."
-                                .to_string(),
-                        ),
-                    );
-                    return Err(());
-                }
-                v.clone()
-            }
-            Err(diag) => {
-                diagnostics.add(diag.with_location(self.filename.clone(), line_number));
-                return Err(());
-            }
-        };
-
-        let mut arr = array.as_array().unwrap().clone();
-
-        let moves = match moves_value.as_array() {
-            Some(m) => m,
-            None => {
-                diagnostics.add(
-                    Diagnostic::new(
-                        DiagnosticLevel::Fatal,
-                        DiagnosticCode::WrongFieldType,
-                        "I expected the moves to be an array of [from, to] pairs.".to_string(),
-                    )
-                    .with_location(self.filename.clone(), line_number),
-                );
-                return Err(());
-            }
-        };
-
-        for move_pair in moves {
-            let pair = match move_pair.as_array() {
-                Some(p) if p.len() == 2 => p,
-                _ => {
-                    diagnostics.add(
-                        Diagnostic::new(
-                            DiagnosticLevel::Fatal,
-                            DiagnosticCode::WrongFieldType,
-                            "I expected each move to be a [from, to] pair.".to_string(),
-                        )
-                        .with_location(self.filename.clone(), line_number),
-                    );
-                    return Err(());
-                }
-            };
-
-            let from_idx = match pair[0].as_u64() {
-                Some(i) => i as usize,
-                None => {
-                    diagnostics.add(
-                        Diagnostic::new(
-                            DiagnosticLevel::Fatal,
-                            DiagnosticCode::InvalidMoveIndex,
-                            "I expected the 'from' index to be a non-negative integer.".to_string(),
-                        )
-                        .with_location(self.filename.clone(), line_number),
-                    );
-                    return Err(());
-                }
-            };
-
-            let to_idx = match pair[1].as_u64() {
-                Some(i) => i as usize,
-                None => {
-                    diagnostics.add(
-                        Diagnostic::new(
-                            DiagnosticLevel::Fatal,
-                            DiagnosticCode::InvalidMoveIndex,
-                            "I expected the 'to' index to be a non-negative integer.".to_string(),
-                        )
-                        .with_location(self.filename.clone(), line_number),
-                    );
-                    return Err(());
-                }
-            };
-
-            if from_idx >= arr.len() {
-                diagnostics.add(
-                    Diagnostic::new(
-                        DiagnosticLevel::Fatal,
-                        DiagnosticCode::MoveIndexOutOfBounds,
-                        format!(
-                            "The 'from' index {} is out of bounds (array length is {}).",
-                            from_idx,
-                            arr.len()
-                        ),
-                    )
-                    .with_location(self.filename.clone(), line_number),
-                );
-                return Err(());
-            }
-
-            if to_idx > arr.len() {
-                diagnostics.add(
-                    Diagnostic::new(
-                        DiagnosticLevel::Fatal,
-                        DiagnosticCode::MoveIndexOutOfBounds,
-                        format!(
-                            "The 'to' index {} is out of bounds (array length is {}).",
-                            to_idx,
-                            arr.len()
-                        ),
-                    )
-                    .with_location(self.filename.clone(), line_number),
-                );
-                return Err(());
-            }
-
-            let element = arr[from_idx].clone();
-            arr.insert(to_idx, element);
-            let remove_idx = if from_idx > to_idx {
-                from_idx + 1
-            } else {
-                from_idx
-            };
-            arr.remove(remove_idx);
-        }
-
-        pointer.set(state, Value::Array(arr)).map_err(|diag| {
-            diagnostics.add(diag.with_location(self.filename.clone(), line_number));
-        })
-    }
+    pointer.set(state, Value::Array(arr))
 }
 
 #[cfg(test)]

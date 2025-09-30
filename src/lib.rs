@@ -23,6 +23,7 @@ pub mod archive;
 pub mod detection;
 pub mod diagnostics;
 pub mod diff;
+pub mod event_deserialize;
 pub mod events;
 pub mod flags;
 pub mod pointer;

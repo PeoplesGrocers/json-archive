@@ -201,14 +201,27 @@ The format uses only standard JSON. No special parsing required.
 
 ## Contributing
 
-This is a practical tool built for real workflow needs. Contributions welcome, especially:
+Contributions are welcome! However, you will need to sign a contributor license agreement with Peoples Grocers before we can accept your pull request.
+
+I promise to fix bugs quickly, but the overall design prioritizes being hackable over raw performance. This means many obvious performance improvements won't be implemented as they would compromise the tool's simplicity and inspectability.
+
+Areas where contributions are especially appreciated:
 
 - Additional CLI commands (validate, info, extract)
-- Performance optimizations for large archives
-- More compression format support
 - Better diff algorithms for arrays
+- More compression format support
+- Bug fixes and edge case handling
 
 ## License
+
+This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). This means:
+
+- You can use, modify, and distribute this software
+- If you modify and distribute it, you must share your changes under the same license
+- If you run a modified version on a server or embed it in a larger system, you must make the entire system's source code available to users
+- No TiVoization - hardware restrictions that prevent users from running modified versions are prohibited
+
+The AGPL ensures that improvements to this tool remain open and available to everyone, even when used in hosted services or embedded systems.
 
 ---
 
