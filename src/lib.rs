@@ -36,4 +36,4 @@ pub use detection::is_json_archive;
 pub use diagnostics::{Diagnostic, DiagnosticCode, DiagnosticCollector, DiagnosticLevel};
 pub use events::{Event, Header, Observation};
 pub use pointer::JsonPointer;
-pub use reader::{ArchiveReader, ReadMode, ReadResult};
+pub use reader::{apply_add, apply_change, apply_move, apply_remove, ArchiveReader, ReadMode, ReadResult};

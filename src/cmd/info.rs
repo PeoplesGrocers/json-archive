@@ -21,11 +21,8 @@
 
 use crate::flags;
 use chrono::{DateTime, Utc};
-use json_archive::{Diagnostic, DiagnosticCode, DiagnosticLevel};
+use json_archive::{Diagnostic, DiagnosticCode, DiagnosticLevel, Event};
 use serde::Serialize;
-use serde_json::Value;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 #[derive(Debug)]
@@ -53,6 +50,8 @@ struct JsonInfoOutput {
     file_size: u64,
     snapshot_count: usize,
     observations: Vec<JsonObservation>,
+    total_json_size: u64,
+    efficiency_percent: f64,
 }
 
 pub fn run(flags: &flags::Info) -> Vec<Diagnostic> {
@@ -69,8 +68,8 @@ pub fn run(flags: &flags::Info) -> Vec<Diagnostic> {
         )];
     }
 
-    let observations = match collect_observations(&flags.file) {
-        Ok(obs) => obs,
+    let (observations, snapshot_count) = match collect_observations(&flags.file) {
+        Ok((obs, count)) => (obs, count),
         Err(diagnostics) => return diagnostics,
     };
 
@@ -79,7 +78,15 @@ pub fn run(flags: &flags::Info) -> Vec<Diagnostic> {
         Err(_) => 0,
     };
 
-    let snapshot_count = count_snapshots(&flags.file).unwrap_or(0);
+    // Calculate total JSON size (sum of all observations + newline separators)
+    let total_json_size: u64 = observations.iter().map(|obs| obs.json_size as u64).sum::<u64>()
+        + (observations.len() as u64).saturating_sub(1); // Add newlines between observations
+
+    let efficiency_percent = if total_json_size > 0 {
+        (file_size as f64 / total_json_size as f64) * 100.0
+    } else {
+        0.0
+    };
 
     // Check output format
     let is_json_output = flags.output.as_ref().map(|s| s == "json").unwrap_or(false);
@@ -93,6 +100,8 @@ pub fn run(flags: &flags::Info) -> Vec<Diagnostic> {
                 file_size,
                 snapshot_count,
                 observations: Vec::new(),
+                total_json_size: 0,
+                efficiency_percent: 0.0,
             };
             println!(
                 "{}",
@@ -123,6 +132,8 @@ pub fn run(flags: &flags::Info) -> Vec<Diagnostic> {
             file_size,
             snapshot_count,
             observations: json_observations,
+            total_json_size,
+            efficiency_percent,
         };
 
         println!(
@@ -193,10 +204,22 @@ pub fn run(flags: &flags::Info) -> Vec<Diagnostic> {
         } else {
             format!("{} snapshots", snapshot_count)
         };
+
+        let comparison = if efficiency_percent < 100.0 {
+            format!("{:.1}% smaller", 100.0 - efficiency_percent)
+        } else {
+            format!("{:.1}% larger", efficiency_percent - 100.0)
+        };
+
         println!(
-            "Total archive size: {} ({})",
+            "Archive size: {} ({}, {} than JSON Lines)",
             format_size(file_size),
-            snapshot_text
+            snapshot_text,
+            comparison
+        );
+        println!(
+            "Data size: {}",
+            format_size(total_json_size)
         );
 
         // Add usage instructions
@@ -222,9 +245,9 @@ pub fn run(flags: &flags::Info) -> Vec<Diagnostic> {
     Vec::new()
 }
 
-fn collect_observations(file_path: &Path) -> Result<Vec<ObservationInfo>, Vec<Diagnostic>> {
-    let file = match File::open(file_path) {
-        Ok(f) => f,
+fn collect_observations(file_path: &Path) -> Result<(Vec<ObservationInfo>, usize), Vec<Diagnostic>> {
+    let reader = match json_archive::ArchiveReader::new(file_path, json_archive::ReadMode::AppendSeek) {
+        Ok(r) => r,
         Err(e) => {
             return Err(vec![Diagnostic::new(
                 DiagnosticLevel::Fatal,
@@ -234,43 +257,31 @@ fn collect_observations(file_path: &Path) -> Result<Vec<ObservationInfo>, Vec<Di
         }
     };
 
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    let mut observations = Vec::new();
-
-    // Parse header
-    let header_line = match lines.next() {
-        Some(Ok(line)) => line,
-        _ => {
-            return Err(vec![Diagnostic::new(
-                DiagnosticLevel::Fatal,
-                DiagnosticCode::EmptyFile,
-                "Archive file is empty or unreadable".to_string(),
-            )]);
-        }
-    };
-
-    let header: Value = match serde_json::from_str(&header_line) {
-        Ok(h) => h,
+    let (initial_state, mut event_iter) = match reader.events(file_path) {
+        Ok(r) => r,
         Err(e) => {
             return Err(vec![Diagnostic::new(
                 DiagnosticLevel::Fatal,
-                DiagnosticCode::MissingHeader,
-                format!("I couldn't parse the header: {}", e),
+                DiagnosticCode::PathNotFound,
+                format!("I couldn't read the archive file: {}", e),
             )]);
         }
     };
 
-    let created_str = header["created"].as_str().unwrap_or("");
-    let created: DateTime<Utc> = match created_str.parse() {
-        Ok(dt) => dt,
-        Err(_) => Utc::now(),
-    };
+    // Check for fatal diagnostics from initial parsing
+    if event_iter.diagnostics.has_fatal() {
+        return Err(event_iter.diagnostics.diagnostics().to_vec());
+    }
 
-    let initial_state = header["initial"].clone();
+    let mut observations = Vec::new();
+    let mut current_state = initial_state.clone();
+    let mut snapshot_count = 0;
+
     let initial_size = serde_json::to_string(&initial_state)
         .unwrap_or_default()
         .len();
+
+    let created = event_iter.header.created;
 
     // Add initial state as observation 0
     observations.push(ObservationInfo {
@@ -281,96 +292,85 @@ fn collect_observations(file_path: &Path) -> Result<Vec<ObservationInfo>, Vec<Di
         json_size: initial_size,
     });
 
-    let mut current_state = initial_state;
-
-    // Parse events
-    for line in lines {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        if line.trim().starts_with('#') || line.trim().is_empty() {
-            continue;
-        }
-
-        let event: Value = match serde_json::from_str(&line) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        if let Some(arr) = event.as_array() {
-            if arr.is_empty() {
-                continue;
-            }
-
-            let event_type = arr[0].as_str().unwrap_or("");
-
-            if event_type == "observe" && arr.len() >= 4 {
-                let obs_id = arr[1].as_str().unwrap_or("").to_string();
-                let timestamp_str = arr[2].as_str().unwrap_or("");
-                let change_count = arr[3].as_u64().unwrap_or(0) as usize;
-
-                let timestamp: DateTime<Utc> = match timestamp_str.parse() {
-                    Ok(dt) => dt,
-                    Err(_) => continue,
-                };
-
+    // Iterate through events
+    while let Some(event) = event_iter.next() {
+        match event {
+            Event::Observe { observation_id, timestamp, change_count } => {
                 observations.push(ObservationInfo {
-                    id: obs_id,
+                    id: observation_id,
                     timestamp,
                     created,
                     change_count,
                     json_size: 0, // Will be calculated after applying events
                 });
-            } else {
-                // Apply the event to current_state for size calculation
-                apply_event_to_state(&mut current_state, &arr);
+            }
+            Event::Add { path, value, .. } => {
+                let _ = json_archive::apply_add(&mut current_state, &path, value);
 
                 // Update the JSON size of the last observation
                 if let Some(last_obs) = observations.last_mut() {
-                    last_obs.json_size = serde_json::to_string(&current_state)
-                        .unwrap_or_default()
-                        .len();
+                    if last_obs.id != "initial" {
+                        last_obs.json_size = serde_json::to_string(&current_state)
+                            .unwrap_or_default()
+                            .len();
+                    }
+                }
+            }
+            Event::Change { path, new_value, .. } => {
+                let _ = json_archive::apply_change(&mut current_state, &path, new_value);
+
+                // Update the JSON size of the last observation
+                if let Some(last_obs) = observations.last_mut() {
+                    if last_obs.id != "initial" {
+                        last_obs.json_size = serde_json::to_string(&current_state)
+                            .unwrap_or_default()
+                            .len();
+                    }
+                }
+            }
+            Event::Remove { path, .. } => {
+                let _ = json_archive::apply_remove(&mut current_state, &path);
+
+                // Update the JSON size of the last observation
+                if let Some(last_obs) = observations.last_mut() {
+                    if last_obs.id != "initial" {
+                        last_obs.json_size = serde_json::to_string(&current_state)
+                            .unwrap_or_default()
+                            .len();
+                    }
+                }
+            }
+            Event::Move { path, moves, .. } => {
+                let _ = json_archive::apply_move(&mut current_state, &path, moves);
+
+                // Update the JSON size of the last observation
+                if let Some(last_obs) = observations.last_mut() {
+                    if last_obs.id != "initial" {
+                        last_obs.json_size = serde_json::to_string(&current_state)
+                            .unwrap_or_default()
+                            .len();
+                    }
+                }
+            }
+            Event::Snapshot { object, .. } => {
+                current_state = object;
+                snapshot_count += 1;
+
+                // Update the JSON size of the last observation
+                if let Some(last_obs) = observations.last_mut() {
+                    if last_obs.id != "initial" {
+                        last_obs.json_size = serde_json::to_string(&current_state)
+                            .unwrap_or_default()
+                            .len();
+                    }
                 }
             }
         }
     }
 
-    Ok(observations)
+    Ok((observations, snapshot_count))
 }
 
-fn apply_event_to_state(state: &mut Value, event: &[Value]) {
-    if event.is_empty() {
-        return;
-    }
-
-    let event_type = event[0].as_str().unwrap_or("");
-
-    match event_type {
-        "add" if event.len() >= 3 => {
-            let path = event[1].as_str().unwrap_or("");
-            let value = event[2].clone();
-            if let Ok(pointer) = json_archive::pointer::JsonPointer::new(path) {
-                let _ = pointer.set(state, value);
-            }
-        }
-        "change" if event.len() >= 3 => {
-            let path = event[1].as_str().unwrap_or("");
-            let value = event[2].clone();
-            if let Ok(pointer) = json_archive::pointer::JsonPointer::new(path) {
-                let _ = pointer.set(state, value);
-            }
-        }
-        "remove" if event.len() >= 2 => {
-            let path = event[1].as_str().unwrap_or("");
-            if let Ok(pointer) = json_archive::pointer::JsonPointer::new(path) {
-                let _ = pointer.remove(state);
-            }
-        }
-        _ => {}
-    }
-}
 
 fn format_timestamp(dt: &DateTime<Utc>) -> String {
     dt.format("%a %H:%M:%S %d-%b-%Y").to_string()
@@ -392,19 +392,4 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
-}
-
-fn count_snapshots(file_path: &Path) -> Result<usize, std::io::Error> {
-    let file = File::open(file_path)?;
-    let reader = BufReader::new(file);
-    let mut count = 0;
-
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().starts_with('[') && line.contains("\"snapshot\"") {
-            count += 1;
-        }
-    }
-
-    Ok(count)
 }

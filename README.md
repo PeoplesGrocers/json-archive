@@ -57,11 +57,19 @@ json-archive videoID.info.json
 
 ### Compression support (as a concession)
 
-While the core design keeps things simple and readable, the tool does work with compressed archives as a practical concession for those who need it. You can read from and write to gzip, brotli, and zlib compressed files without special flags.
+While the core design keeps things simple and readable, the tool does work with compressed archives as a practical concession for those who need it. You can read from and write to gzip, deflate, zlib, brotli, and zstd compressed files without special flags.
 
 **Important caveat**: Compressed archives may require rewriting the entire file during updates (depending on the compression format). If your temporary filesystem is full or too small, updates can fail. In that case, manually specify an output destination with `-o` to write the new archive elsewhere.
 
 This works fine for the happy path with archive files up to a few hundred megabytes, but contradicts the "keep it simple" design philosophy - it's included because it's practically useful.
+
+**Building without compression**: Compression libraries are a security vulnerability vector. The default build includes them because most users want convenience. If you don't want to bundle compression libraries:
+
+```bash
+cargo install json-archive --no-default-features
+```
+
+The minimal build detects compressed files and errors with a clear message explaining you need the full version or manual decompression.
 
 ## Archive format
 
