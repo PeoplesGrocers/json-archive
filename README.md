@@ -57,7 +57,11 @@ json-archive videoID.info.json
 
 ### Compression support (as a concession)
 
-While the core design keeps things simple and readable, the tool does work with compressed archives as a practical concession for those who need it. You can read from and write to gzip, deflate, zlib, brotli, and zstd compressed files without special flags.
+While the core design keeps things simple and readable, the tool does work with compressed archives as a practical concession for those who need it. You can read from and write to gzip, deflate, zlib, and brotli compressed files without special flags.
+
+**⚠️ Note:** zstd support is planned but not yet implemented. Use one of the other compression formats for now.
+
+For worked examples and details, see the [compression guide](docs/compression-guide.md).
 
 **Important caveat**: Compressed archives may require rewriting the entire file during updates (depending on the compression format). If your temporary filesystem is full or too small, updates can fail. In that case, manually specify an output destination with `-o` to write the new archive elsewhere.
 
@@ -100,6 +104,7 @@ The tool infers behavior from filenames:
 
 - [Info command](docs/info-command.md) - View archive metadata and observation timeline
 - [State command](docs/state-command.md) - Retrieve JSON state at specific observations
+- [Compression guide](docs/compression-guide.md) - Working with compressed archives
 - [File format specification](docs/file-format-spec.md) - Technical details about the archive format
 
 ### Creating archives

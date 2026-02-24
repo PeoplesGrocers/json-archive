@@ -172,3 +172,33 @@ json-archive --source "yt-dlp:youtube:dQw4w9WgXcQ" v1.json v2.json v3.json
 **What happens:**
 - Adds source identifier to archive header
 - Helps track where the data came from in complex workflows
+
+## Working with Compressed Archives
+
+This directory includes compressed versions of the demo archive:
+- `v1.json.archive.gz` - gzip compressed
+- `v1.json.archive.zst` - zstd compressed (⚠️ zstd not yet working)
+
+### Using the gzip archive
+
+All commands work transparently with compressed archives:
+
+```bash
+# View archive info
+json-archive info v1.json.archive.gz
+
+# Get the initial state
+json-archive state --index 0 v1.json.archive.gz
+
+# Get latest state
+json-archive state v1.json.archive.gz
+```
+
+### Creating your own compressed archive
+
+```bash
+# Create a gzip-compressed archive from the demo files
+json-archive -o v1.json.archive.gz v1.json v2.json v3.json
+```
+
+For more compression examples, see the [compression guide](../compression-guide.md).
